@@ -102,6 +102,12 @@ with st.sidebar:
 
     st.header("Quadtree")
     error_thresh = st.select_slider("Error threshold", options=ERROR_THRESHOLDS, value=100)
+    quantization_aware = st.checkbox(
+        "Quantization-aware domain search", value=False,
+        help="Picks each block's domain position by post-quantization error "
+             "instead of continuous error — same cost, but measured up to "
+             "+12 dB PSNR on some images. See the README for why.",
+    )
 
     with st.expander("Advanced settings"):
         max_block = st.selectbox("max_block", [16, 32, 64, 128], index=2)
@@ -144,7 +150,8 @@ if encode_clicked:
         pil_img = resize_preserve_aspect(pil_img, resolution)
         arr = np.array(pil_img).astype(np.float64)
         cfg = FractalConfig(error_thresh=error_thresh, max_block=max_block, min_block=min_block,
-                             step=step, k_bits=k_bits, c_bits=c_bits)
+                             step=step, k_bits=k_bits, c_bits=c_bits,
+                             quantization_aware=quantization_aware)
         is_color = color_mode == "Color"
 
         with st.spinner("Encoding…"):
