@@ -7,6 +7,8 @@ Produces:
   results/ablation_error_thresh.csv  quality/size/time vs ERROR_THRESH
   results/ablation_error_thresh.png
   results/color_chroma.csv           chroma-subsampling on/off comparison
+  results/quantization_aware.csv     continuous- vs quantized-error domain search
+  results/quantization_aware.png
 
 Run with:  python3 benchmarks/run_benchmark.py
 """
@@ -182,8 +184,58 @@ def run_color_experiment():
     return rows
 
 
+def run_quantization_aware_comparison():
+    print("== Quantization-aware vs continuous-error domain search ==")
+    rows = []
+    error_threshs = [30, 60, 100, 150, 250, 400, 700]
+
+    for name, img in get_test_images().items():
+        for et in error_threshs:
+            for quant_aware in [False, True]:
+                cfg = FractalConfig(error_thresh=et, max_block=64, step=1,
+                                     quantization_aware=quant_aware)
+                t0 = time.time()
+                enc = encode_channel(img, cfg)
+                enc_time = time.time() - t0
+                recon = decode_channel(enc)
+                rows.append({
+                    "image": name, "quantization_aware": quant_aware, "error_thresh": et,
+                    "bpp": enc.bits_per_pixel(), "psnr": psnr(img, recon),
+                    "ssim": ssim_score(img, recon), "encode_s": enc_time,
+                })
+                print(f"  {name} ET={et:>4} quant_aware={quant_aware!s:5} "
+                      f"bpp={enc.bits_per_pixel():.3f} PSNR={psnr(img, recon):.2f} enc={enc_time:.2f}s")
+
+    with open(os.path.join(RESULTS_DIR, "quantization_aware.csv"), "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+    fig, axes = plt.subplots(1, len(get_test_images()), figsize=(6 * len(get_test_images()), 5))
+    if len(get_test_images()) == 1:
+        axes = [axes]
+    for ax, name in zip(axes, get_test_images().keys()):
+        for quant_aware, marker in [(False, "o-"), (True, "^-")]:
+            pts = [(r["bpp"], r["psnr"]) for r in rows
+                   if r["image"] == name and r["quantization_aware"] == quant_aware]
+            pts.sort()
+            xs, ys = zip(*pts)
+            label = "quantization-aware search" if quant_aware else "continuous-error search (current)"
+            ax.plot(xs, ys, marker, label=label)
+        ax.set_xlabel("bits per pixel")
+        ax.set_ylabel("PSNR (dB)")
+        ax.set_title(name)
+        ax.legend()
+        ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(RESULTS_DIR, "quantization_aware.png"), dpi=130)
+    print("  saved quantization_aware.csv / .png\n")
+    return rows
+
+
 if __name__ == "__main__":
     run_rate_distortion()
     run_ablation()
     run_color_experiment()
+    run_quantization_aware_comparison()
     print("Done. See results/ for CSVs and plots.")

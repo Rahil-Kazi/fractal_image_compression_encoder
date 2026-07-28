@@ -21,7 +21,10 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.signal import correlate
 
-from .codec import FractalConfig, Transform, EncodedChannel, quantize, dequantize
+from .codec import (
+    FractalConfig, Transform, EncodedChannel,
+    quantize, dequantize, quantize_array, dequantize_array,
+)
 from .bitstream import BitWriter
 
 
@@ -104,7 +107,48 @@ def _search_domain(range_block: np.ndarray, recon_known: np.ndarray,
     err = range_centered_sq - np.where(denom > 1e-6, (numerator ** 2) / denom_safe, 0.0)
     err = np.clip(err, 0.0, None)
 
-    idx = np.unravel_index(np.argmin(err), err.shape)
+    # Quantization-aware position selection (opt-in via config.quantization_aware).
+    #
+    # In plain terms: the block above picks whichever domain position looks
+    # like the best match *before* K and C get rounded to fit their 5-bit/
+    # 7-bit slots in the file format. That's usually fine, but occasionally a
+    # position that looked slightly worse before rounding rounds *better*
+    # than the one that looked best -- so the position `err`'s argmin picks
+    # isn't always the position that reconstructs best once quantization
+    # actually happens. This block re-picks the position using the error
+    # *after* quantization instead.
+    #
+    # K and C don't need a joint/conditional search to do this: because the
+    # domain window is mean-centered before K is applied and C is added back
+    # (see the class docstring), the optimal C never depends on which K you
+    # pick and vice versa -- rounding each to its own nearest grid value,
+    # independently, already gives the best achievable discrete (K, C) pair.
+    # The only subtlety is that evaluating error at those rounded values
+    # requires mapping our C back to the raw intercept of R ~= K*D + C_eff
+    # (C_eff = avg_domain*(1-K) + C) before plugging into the expanded SSE
+    # formula below -- our C isn't that raw intercept itself.
+    if config.quantization_aware:
+        k_cont = np.where(denom > 1e-6, numerator / denom_safe, 0.0)
+        c_cont = avg_range - avg_domain
+        k_q = dequantize_array(quantize_array(k_cont, config.k_bits, *config.k_range),
+                                config.k_bits, *config.k_range)
+        c_q = dequantize_array(quantize_array(c_cont, config.c_bits, *config.c_range),
+                                config.c_bits, *config.c_range)
+        c_eff = avg_domain * (1.0 - k_q) + c_q
+
+        sum_range = n * avg_range
+        sumsq_range = range_centered_sq + n * avg_range ** 2
+        err_quant = (
+            sumsq_range
+            - 2.0 * k_q * cross
+            - 2.0 * c_eff * sum_range
+            + (k_q ** 2) * sumsq_domain
+            + 2.0 * k_q * c_eff * sum_domain
+            + n * (c_eff ** 2)
+        )
+        idx = np.unravel_index(np.argmin(err_quant), err_quant.shape)
+    else:
+        idx = np.unravel_index(np.argmin(err), err.shape)
     best_y, best_x = idx[0] * step, idx[1] * step
     d = denom[idx]
     best_k = float(numerator[idx] / d) if d > 1e-6 else 0.0

@@ -40,6 +40,9 @@ class FractalConfig:
     c_bits: int = 7
     k_range: tuple = (-1.5, 1.5)
     c_range: tuple = (-255.0, 255.0)
+    quantization_aware: bool = False  # pick the domain position by post-quantization
+                                       # error instead of continuous error; see the
+                                       # design note above _search_domain in encoder.py
 
 
 @dataclass
@@ -62,6 +65,19 @@ def quantize(value: float, bits: int, vmin: float, vmax: float) -> int:
 
 
 def dequantize(idx: int, bits: int, vmin: float, vmax: float) -> float:
+    levels = (1 << bits) - 1
+    return vmin + (idx / levels) * (vmax - vmin)
+
+
+def quantize_array(value: np.ndarray, bits: int, vmin: float, vmax: float) -> np.ndarray:
+    """Elementwise sibling of quantize() -- the scalar version uses Python's
+    int()/round(), which raise on arrays with more than one element."""
+    levels = (1 << bits) - 1
+    t = (value - vmin) / (vmax - vmin)
+    return np.round(np.clip(t, 0.0, 1.0) * levels).astype(np.int64)
+
+
+def dequantize_array(idx: np.ndarray, bits: int, vmin: float, vmax: float) -> np.ndarray:
     levels = (1 << bits) - 1
     return vmin + (idx / levels) * (vmax - vmin)
 
