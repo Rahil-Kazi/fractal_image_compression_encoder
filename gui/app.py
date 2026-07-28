@@ -18,7 +18,10 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import streamlit as st
 from PIL import Image
+import pillow_heif
 from skimage import data as skdata
+
+pillow_heif.register_heif_opener()  # lets Image.open() read HEIC/HEIF (iPhone default) too
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from fractal_compression import (
@@ -87,7 +90,8 @@ with st.sidebar:
     st.header("Image")
     source = st.radio("Source", ["Sample image", "Upload"], index=0)
     if source == "Upload":
-        uploaded_file = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg", "bmp"])
+        uploaded_file = st.file_uploader(
+            "Upload an image", type=["png", "jpg", "jpeg", "bmp", "heic", "heif"])
         sample_name = None
     else:
         uploaded_file = None
@@ -138,9 +142,13 @@ if encode_clicked:
     pil_img, load_error = None, False
     try:
         pil_img = load_source_image(source, uploaded_file, sample_name, color_mode)
-    except Exception:
+    except Exception as e:
         load_error = True
-        st.sidebar.error("Couldn't read that file as an image — try a different PNG/JPEG/BMP.")
+        st.sidebar.error(
+            f"Couldn't read that file as an image ({type(e).__name__}: {e}). "
+            "If it's an iPhone photo, HEIC is supported, but a re-exported "
+            "PNG/JPEG is worth trying if this persists."
+        )
 
     if load_error:
         pass
