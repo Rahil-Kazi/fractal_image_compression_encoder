@@ -188,6 +188,7 @@ def run_quantization_aware_comparison():
     print("== Quantization-aware vs continuous-error domain search ==")
     rows = []
     error_threshs = [30, 60, 100, 150, 250, 400, 700]
+    series_names = list(get_test_images().keys())
 
     for name, img in get_test_images().items():
         for et in error_threshs:
@@ -206,15 +207,40 @@ def run_quantization_aware_comparison():
                 print(f"  {name} ET={et:>4} quant_aware={quant_aware!s:5} "
                       f"bpp={enc.bits_per_pixel():.3f} PSNR={psnr(img, recon):.2f} enc={enc_time:.2f}s")
 
+    # Color case (Y/Cb/Cr, 4:2:0 chroma subsampled) -- same astronaut crop
+    # run_color_experiment() already uses, so this is directly comparable to
+    # that section's numbers. Fewer ERROR_THRESH points than the grayscale
+    # sweep above: each color encode is ~3x a grayscale one (one pass per
+    # channel), and quantization-aware search adds its own overhead on top.
+    color_name = "astronaut_color_96"
+    series_names.append(color_name)
+    color_img = data.astronaut().astype(np.float64)[:96, :96, :]
+    for et in [100, 300]:
+        for quant_aware in [False, True]:
+            cfg = FractalConfig(error_thresh=et, max_block=64, step=1,
+                                 quantization_aware=quant_aware)
+            t0 = time.time()
+            enc = encode_image(color_img, cfg, chroma_subsample=True)
+            enc_time = time.time() - t0
+            recon = np.clip(decode_image(enc), 0, 255)
+            rows.append({
+                "image": color_name, "quantization_aware": quant_aware, "error_thresh": et,
+                "bpp": enc.bits_per_pixel(*color_img.shape[:2]), "psnr": psnr(color_img, recon),
+                "ssim": ssim_score(color_img.astype(np.uint8), recon.astype(np.uint8)),
+                "encode_s": enc_time,
+            })
+            print(f"  {color_name} ET={et:>4} quant_aware={quant_aware!s:5} "
+                  f"bpp={rows[-1]['bpp']:.3f} PSNR={rows[-1]['psnr']:.2f} enc={enc_time:.2f}s")
+
     with open(os.path.join(RESULTS_DIR, "quantization_aware.csv"), "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
 
-    fig, axes = plt.subplots(1, len(get_test_images()), figsize=(6 * len(get_test_images()), 5))
-    if len(get_test_images()) == 1:
+    fig, axes = plt.subplots(1, len(series_names), figsize=(6 * len(series_names), 5))
+    if len(series_names) == 1:
         axes = [axes]
-    for ax, name in zip(axes, get_test_images().keys()):
+    for ax, name in zip(axes, series_names):
         for quant_aware, marker in [(False, "o-"), (True, "^-")]:
             pts = [(r["bpp"], r["psnr"]) for r in rows
                    if r["image"] == name and r["quantization_aware"] == quant_aware]

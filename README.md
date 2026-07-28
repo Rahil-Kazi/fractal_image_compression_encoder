@@ -141,9 +141,13 @@ final image than the one that looked best beforehand — so the position being
 picked wasn't always the position that would reconstruct best after
 quantization actually happened. `quantization_aware=True` picks the position
 using the error *after* quantization instead, at the same O(1)-per-position
-cost as before (no extra search dimension, no slowdown from the search
-itself — see `fractal_compression/encoder.py`'s `_search_domain` for the
-derivation of why this doesn't need a joint K/C search).
+*asymptotic* cost as before (no extra search dimension, no joint K/C search
+— see `fractal_compression/encoder.py`'s `_search_domain` for the
+derivation of why). It isn't free in practice, though: the extra elementwise
+array operations measurably raise the constant factor, ~40–50% slower encode
+in this benchmark (e.g. camera_128 ~0.70s → ~1.00s per image) — worth
+knowing before turning it on for large batches, even though it changes
+nothing about decode speed or the bitstream format.
 
 | Image | ERROR_THRESH | bpp (before) | PSNR (before) | bpp (quant-aware) | PSNR (quant-aware) |
 |---|---|---|---|---|---|
@@ -153,15 +157,20 @@ derivation of why this doesn't need a joint K/C search).
 | coins_128 | 30 | 3.691 | 31.44 dB | 4.087 | **43.11 dB** |
 | coins_128 | 250 | 2.110 | 31.10 dB | 2.495 | **40.94 dB** |
 | coins_128 | 700 | 1.659 | 31.03 dB | 1.874 | **38.50 dB** |
+| astronaut_color_96 (Y+Cb+Cr, 4:2:0) | 100 | 2.936 | 34.63 dB | 2.983 | **38.85 dB** |
+| astronaut_color_96 (Y+Cb+Cr, 4:2:0) | 300 | 2.276 | 34.35 dB | 1.969 | **37.20 dB** |
 
 This is a real, substantial win, not a marginal one: PSNR is higher at
-**every** `ERROR_THRESH` tested on both images (see
+**every** `ERROR_THRESH` tested on all three test cases (see
 `results/quantization_aware.csv`/`.png`), typically at equal or lower bpp on
-`camera_128` and a modest bpp increase on `coins_128` (busier texture means
-more blocks are sensitive to which position gets picked). The size of the
-win — up to +12 dB on `coins_128` — is bigger than a single block's rounding
-error alone would suggest, which makes sense for this specific codec: domain
-sources are always the *reconstructed* buffer (never the original, by
+`camera_128` and the color case, and a modest bpp increase on `coins_128`
+(busier texture means more blocks are sensitive to which position gets
+picked). Color benefits *more* than grayscale, not just as much — the fix
+runs independently on all three channels (Y, Cb, Cr), so the same
+error-compounding effect compounds three times over instead of once. The
+size of the win — up to +13.8 dB, observed live in the GUI on a 256x256 crop
+— is bigger than a single block's rounding error alone would suggest, which
+makes sense for this specific codec: domain sources are always the *reconstructed* buffer (never the original, by
 design — see "Deliberately unchanged" above), so a quantization mismatch in
 an early block doesn't just cost that block, it becomes slightly-wrong raw
 material for every later block that references it. Picking the
