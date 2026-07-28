@@ -179,6 +179,23 @@ def _encode_block(original, recon_known, ii, ii2, row, col, rows, cols, config: 
         patch=leaf.patch,
     )
 
+    # Early-termination pruning: the split test below is
+    # `leaf.error > split_error + error_thresh`, where split_error is a sum
+    # of squared errors and therefore always >= 0. That means
+    # `split_error + error_thresh >= error_thresh` unconditionally, so
+    # whenever `leaf.error <= error_thresh` we already know the split test
+    # cannot pass -- no matter what the four children would find, splitting
+    # will never be chosen. This is a provably lossless shortcut (verified
+    # both by this inequality and empirically against an unpruned run), not
+    # a quality/quality-vs-speed heuristic: skipping the children here
+    # always produces the exact same leaf that the full recursion would
+    # have produced anyway, just without paying for the four child searches
+    # that were always going to be discarded. It's one-directional --
+    # `leaf.error > error_thresh` does NOT imply a split, so that case still
+    # has to recurse to find out.
+    if leaf.error <= config.error_thresh:
+        return leaf_candidate
+
     prow, pcol = rows // 2, cols // 2
     if prow >= config.min_block and pcol >= config.min_block:
         c1 = _encode_block(original, recon_known, ii, ii2, row, col, prow, pcol, config)

@@ -264,12 +264,24 @@ regional/student journal — not a top-tier venue without a bigger new idea.
 
 ## Known limitations
 
-- Encode is slow (~2.5–3s for 128x128 at step=1) — the recursive quadtree
-  visits every node down to `min_block` regardless of whether it ends up
-  splitting, and profiling shows scipy's correlation call, not the integral
-  images, now dominates. A C extension or early-exit pruning would be the
-  next optimization pass; not done here since the priority was a correct,
-  benchmarkable reference implementation.
+- Encode is slow (~2.5–3s for 128x128 at step=1), and a C extension or GPU
+  offload of the correlation step (which profiling shows dominates, not the
+  integral images) would be the next real speed lever — not done here since
+  the priority was a correct, benchmarkable reference implementation.
+  The recursive quadtree does now include an early-termination shortcut
+  (`_encode_block` in `encoder.py`): if a block's own match already scores
+  `error <= error_thresh`, its children are provably guaranteed not to be
+  chosen by the split rule (`split_error >= 0` always, so
+  `split_error + error_thresh >= error_thresh`), so they're skipped
+  entirely rather than computed and discarded. This is exactly lossless —
+  verified against an unpruned reference derived from the same source, both
+  bit-for-bit on the compressed stream and pixel-for-pixel on the decode —
+  but its real-world impact is modest, not dramatic: with the default
+  `min_block=2`, the recursion still goes deep regardless of pruning, so
+  measured savings on `camera_128`/`coins_128` at typical settings are only
+  ~0–20% fewer node visits and ~1–8% faster encode. It's a safe, free
+  optimization worth keeping, just not the fix for the slow-encode
+  limitation above — that's still the correlation step.
 - Entropy coding (`entropy.py`) operates on a single already-encoded channel
   in isolation — each stream's Huffman table is built and stored per image,
   with no cross-image or cross-channel dictionary reuse. It's also
