@@ -4,6 +4,11 @@ A from-scratch Python rewrite of the causal, quadtree-partitioned, non-iterative
 fractal image codec originally prototyped in C++/OpenCV, built for benchmarking
 and (potential) publication rather than just as a port.
 
+See [`CLAUDE.md`](CLAUDE.md) for the build history, the load-bearing math
+derivations, and a log of optimization approaches already tried and
+rejected (with why) — worth reading before extending the search/encoder
+code so you don't re-derive or re-try things already settled.
+
 ## What changed vs. the original C++ codebase
 
 **Fixed / redesigned:**
