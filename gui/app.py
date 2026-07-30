@@ -105,7 +105,24 @@ with st.sidebar:
     resolution = st.select_slider("Working resolution (longer side, px)", options=RESOLUTIONS, value=128)
 
     st.header("Quadtree")
-    error_thresh = st.select_slider("Error threshold", options=ERROR_THRESHOLDS, value=100)
+    rdo_mode = st.checkbox(
+        "Use RDO split (error + λ·bits) instead of fixed threshold", value=False,
+        help="Replaces the flat error_thresh split rule with a Lagrangian "
+             "error + λ·bits criterion (same idea as HEVC/AV1 CTU splitting). "
+             "Measured to land on nearly the same rate-distortion curve as "
+             "the fixed threshold on this codec — see the README for why "
+             "(the fixed-width bitstream makes every leaf cost the same "
+             "number of bits, so there's little for RDO to exploit here).",
+    )
+    if rdo_mode:
+        rdo_lambda = st.select_slider(
+            "RDO λ (higher = fewer, larger leaves)",
+            options=[0.2, 0.5, 1, 2, 5, 10, 20, 50, 100], value=5)
+        error_thresh = 100  # unused while RDO mode is on, kept for FractalConfig
+        st.caption("Error threshold is ignored while RDO split is on.")
+    else:
+        error_thresh = st.select_slider("Error threshold", options=ERROR_THRESHOLDS, value=100)
+        rdo_lambda = None
     quantization_aware = st.checkbox(
         "Quantization-aware domain search", value=False,
         help="Picks each block's domain position by post-quantization error "
@@ -159,7 +176,7 @@ if encode_clicked:
         arr = np.array(pil_img).astype(np.float64)
         cfg = FractalConfig(error_thresh=error_thresh, max_block=max_block, min_block=min_block,
                              step=step, k_bits=k_bits, c_bits=c_bits,
-                             quantization_aware=quantization_aware)
+                             quantization_aware=quantization_aware, rdo_lambda=rdo_lambda)
         is_color = color_mode == "Color"
 
         with st.spinner("Encoding…"):
