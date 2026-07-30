@@ -86,6 +86,22 @@ A long back-and-forth proposed increasingly specific fixes for the ~40–50%
 quantization-aware slowdown. **All were tested empirically before being
 accepted or rejected — this repo's working norm is "verify, don't assume,"
 and it paid off every time here:**
+
+**Important node-profile correction, read this first:** an early measurement
+(used to reject the scratch-buffer idea below) sampled only the *first few*
+node shapes from an encode and found them tiny (1×1–3×3), attributed to
+`min_block=2` forcing deep recursion. That sample was unrepresentative.
+Once early-termination pruning (#5) existed and was combined with
+`quantization_aware=True`, the *actual* profile for a real encode
+(`camera_128`, `error_thresh=100`) is **only 231 total node visits**
+(down from ~5451 measured without pruning/quantization-aware), with a
+**median valid-search-grid size of ~3249 elements** (roughly 57×57) — medium,
+not tiny. The two features compound: better-quantized matches have lower
+error, so `leaf.error <= error_thresh` fires far more often, pruning far
+more aggressively. **All the rejections below were re-verified against this
+corrected, realistic profile** — the conclusions held, but for different
+reasons than originally stated in a couple of cases (noted inline).
+
 - **ML feature embeddings + FAISS/ANN nearest-neighbor search** to replace
   the exhaustive correlation search: rejected without implementation. The
   domain pool here is the *causal, growing* reconstructed region, not a
@@ -93,25 +109,82 @@ and it paid off every time here:**
   grows, likely costing more than the search it replaces. Also breaks the
   affine-invariance the search needs (K/C already handle contrast/brightness
   invariance; a generic embedding isn't guaranteed to preserve that).
+- **Spatial-locality windowing** (restrict the domain search to a local
+  neighborhood around the range block instead of the full causal region,
+  on the theory that self-similar matches are usually nearby): **directly
+  contradicted by measured match-distance data.** On both test images, the
+  median distance between a range block and its chosen domain match is
+  ~62px on a 128px canvas, and ~47–49% of matches sit beyond 64px (the far
+  side of the image). This is consistent with an earlier, independent
+  finding from the entropy-coding work (#1): delta-encoding coordinates
+  relative to the range block's position measured *worse* (higher entropy)
+  than absolute coordinates, for the same underlying reason — this causal
+  codec's matches are not spatially clustered near their source blocks.
+  Windowing would blind the search to roughly half its real matches; not a
+  free speedup, a real quality cost that was never even worth ablating
+  given how strongly the data pointed against it.
+- **Depth-dependent strided search via `scipy.signal.correlate`** (full
+  `step=1` for large blocks, coarser stride for small ones): the *quality*
+  side looked safe (existing global `step=1` vs `step=2` ablation in
+  `results/ablation_error_thresh.csv` shows near-zero PSNR difference), but
+  the *speed* side doesn't deliver what it promises with the current
+  architecture. `config.step` already exists, but it slices `correlate()`'s
+  **output** *after* the full-resolution FFT/correlate call already ran —
+  measured: `step=1` → `step=4` only cut encode time ~15% (0.041s → 0.035s
+  on `camera_128`), because the dominant cost (`correlate` itself) is
+  untouched. A proposed fix — decimate the **input** (`recon_known`) before
+  correlating — was caught as an actual correctness bug, not just
+  underwhelming: it silently changes same-size domain-block search into a
+  classical *larger-domain-downsampled-to-range-size* search (verified by
+  computing both approaches on identical input and showing the outputs
+  differ, then tracing why) — a fundamental violation of this codec's
+  documented "same-size domain/range blocks" design, not a performance
+  tradeoff. A *correct* strided search would need a bespoke sliding-window
+  implementation (e.g. `numpy.lib.stride_tricks.sliding_window_view` on a
+  decimated candidate-position grid) since `scipy.signal.correlate` has no
+  native way to compute only a strided subset of output positions cheaper
+  than computing all of them. Not implemented; would need its own
+  from-scratch correctness verification against a brute-force reference
+  before trusting it, same as everything else in this list.
 - **GPU offload via PyTorch (`F.conv2d`) for the correlation step:**
-  plausible in principle, but the codec recurses to `min_block` at every
-  node (~5000+ node visits for a 128×128 image), so per-node GPU kernel
-  launch/host-device-transfer overhead on mostly-tiny nodes was flagged as
-  a real risk. Multiple rounds of proposed code had actual bugs (squaring a
-  ones-kernel instead of the input array for `sum_sq_D`; a `groups=` conv2d
-  batching call with input on the wrong axis — batch vs. channel — that
-  would error at runtime for any batch size > 1). Never implemented; not
-  clearly worth pursuing given the node-size distribution below.
+  tested twice, rejected both times, for different reasons.
+  - First pass (stale profile, ~5000+ tiny nodes): rejected on the
+    reasoning that per-node kernel-launch/host-device-transfer overhead
+    would dominate on mostly-tiny arrays. Proposed code also had real bugs
+    (squaring a ones-kernel instead of the input array for `sum_sq_D`; a
+    `groups=` conv2d batching call with input on the wrong axis — batch vs.
+    channel — that would error at runtime for any batch size > 1).
+  - Second pass, after the node-profile correction above (231 nodes,
+    medium arrays — a much more GPU-favorable shape on paper): **tested
+    directly on real hardware (Apple Silicon, MPS backend — no CUDA
+    available) against all 231 real node shapes from an actual encode,
+    full round-trip cost included (tensor creation, host→device transfer,
+    `F.conv2d`, device→host).** Result: **MPS was 8x slower than
+    `scipy.signal.correlate`** even after 50 warmup calls and taking the
+    best of 3 timed passes (0.58ms/node vs. 0.07ms/node). Root cause is the
+    same category as the scratch-buffer finding below — fixed per-call
+    dispatch overhead (MPS command-buffer submission, in this case)
+    dominating over compute at this array size — just manifesting in the
+    GPU driver layer instead of NumPy. **Per-node GPU dispatch is
+    conclusively off the table on this hardware at this problem size.**
+    The only way GPU could still plausibly help is genuine batching (many
+    nodes in one call), which requires restructuring the recursion into a
+    level-order/BFS traversal first — not attempted, real engineering
+    effort, not a quick swap.
 - **Pre-allocated NumPy scratch buffers (`out=` parameter) to avoid
-  reallocating arrays per node:** **tested directly, made things 12%
-  *slower*, not faster.** Instrumented a real encode: most nodes have tiny
-  search grids (median close to 1×1–3×3, because `min_block=2` forces deep
-  recursion). At that size, NumPy's fixed per-call dispatch overhead
-  dominates over allocation cost, and the buffered version needed *more*
-  distinct NumPy calls (~15 granular `out=` ops vs. one compact vectorized
-  expression), which is a net loss. **Don't try `out=` buffer reuse here
-  again unless the array sizes involved change substantially** (e.g. if
-  `min_block` is raised so nodes stay large).
+  reallocating arrays per node:** tested twice, rejected both times.
+  - First pass (stale profile): 12% slower than the naive vectorized
+    version.
+  - **Re-tested against the corrected, realistic 231-node/medium-array
+    profile specifically because the original rejection's node-shape data
+    was stale — still a net loss, 31% slower.** So this isn't a "small
+    array" artifact as originally framed; NumPy's per-call dispatch
+    overhead dominates allocation cost even at ~3249-element arrays,
+    because the buffered version needs ~15 granular `out=` calls vs. one
+    compact vectorized expression. **Don't retry `out=` buffer reuse in
+    `_search_domain` again without a fundamentally different array-size
+    regime than what's been tested** (both the ~1–9 element and
+    ~3249-element regimes have now been checked and rejected).
 
 ### 5. Early-termination quadtree pruning (`_encode_block` in `encoder.py`)
 **Proof (load-bearing):** the split rule is
