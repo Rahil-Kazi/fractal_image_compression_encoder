@@ -195,14 +195,54 @@ efficiently already-achieved values get packed.
 
 | ERROR_THRESH | leaves | bpp | PSNR |
 |---|---|---|---|
-| 30 | 486 | 0.819 | 40.91 |
-| 100 | 174 | 0.298 | 40.70 |
-| 400 | 87 | 0.153 | 40.51 |
+| 30 | 444 | 0.749 | 40.90 |
+| 100 | 228 | 0.388 | 40.67 |
+| 400 | 84 | 0.148 | 40.57 |
 | 1200 | 66 | 0.118 | 40.34 |
 
-Leaf count (and thus bitrate) drops ~7x from ERROR_THRESH=30 to 1200 for a PSNR
+Leaf count (and thus bitrate) drops ~6.7x from ERROR_THRESH=30 to 1200 for a PSNR
 loss of only ~0.6 dB — most of the quadtree's fine splitting is buying very
 little quality on this image, another quantified, paper-worthy observation.
+
+### RDO quadtree split (`FractalConfig(rdo_lambda=...)`)
+
+In plain terms: the quadtree currently decides whether to split a block
+into four smaller ones by asking "does splitting reduce error by more than
+a fixed amount (`error_thresh`)?" — regardless of how many actual bits that
+split costs. `rdo_lambda` replaces that with the standard rate-distortion
+criterion used in video codec block partitioning (the same idea behind
+HEVC/AV1 CTU splitting): split only if it lowers the combined score
+`error + λ·bits`, where `bits` is the real, measured bit cost of the
+leaf-vs-split choice — not a fixed threshold. Like the fixed-threshold path,
+this has its own provably-lossless early-termination shortcut (see the
+design note above the split logic in `_encode_block`), so it's not slower
+in principle for the same reason the original pruning isn't.
+
+| Image | λ | leaves | bpp | PSNR | ⟷ | ERROR_THRESH | leaves | bpp | PSNR |
+|---|---|---|---|---|---|---|---|---|---|
+| camera_128 | 0.2 | 519 | 0.873 | 40.92 dB | | 30 | 444 | 0.749 | 40.90 dB |
+| camera_128 | 5 | 81 | 0.143 | 40.55 dB | | 250 | 96 | 0.168 | 40.58 dB |
+| camera_128 | 10 | 66 | 0.118 | 40.34 dB | | 1200 | 66 | 0.118 | 40.34 dB |
+| coins_128 | 0.2 | 2499 | 4.177 | 31.62 dB | | 30 | 2208 | 3.691 | 31.44 dB |
+| coins_128 | 10 | 909 | 1.524 | 31.01 dB | | 700 | 990 | 1.659 | 31.03 dB |
+
+**Honest finding: on this codec specifically, RDO and the fixed threshold
+land on nearly the same rate-distortion curve** (`results/rdo_quadtree.png`)
+— not a clear win either way. There's a structural reason, not just
+coincidence: this codec's bitstream is fixed-width, so `per_leaf_bits` (the
+bit cost of one leaf) is a **constant**, independent of block size or
+content. For any node whose children don't themselves split further, the
+Lagrangian test algebraically reduces to
+`leaf.error − split_error > λ·(1 + 3·per_leaf_bits)` — literally the same
+*form* as `error_thresh`, just reparameterized. The genuine advantage RDO
+has over a flat threshold — correctly weighing splits whose bit cost varies
+with content or size — doesn't get to show up here because leaf bit cost
+never varies. It would matter more paired with content-adaptive bit
+allocation (variable K/C precision) or with entropy coding's *actual*,
+non-uniform realized bit costs (`entropy.py` already shows `c_idx` costs
+measurably fewer real bits than `k_idx`) feeding into `λ·bits` instead of
+the fixed-width estimate — not implemented here, a natural next step if
+this is revisited.
 
 ### Color: chroma subsampling (astronaut, 96x96, ERROR_THRESH=100)
 
@@ -253,10 +293,19 @@ contribution from this codebase would be one of:
    source (`fractal_compression/decoder.py`) turns out to be *why* the win
    compounds as large as it does — errors from a suboptimal match propagate
    into every later block that references it.
-3. **Adaptive ERROR_THRESH / block size selection.** The ablation shows most
-   fine-grained splitting buys little quality; a content-adaptive threshold
-   (or rate-distortion-optimal quadtree pruning, à la RDO in video codecs)
-   is a measurable, defensible contribution.
+3. ~~Adaptive ERROR_THRESH / RDO-style block size selection.~~ **Done, and
+   measured to land on essentially the same rate-distortion curve as the
+   existing fixed threshold** — see the RDO quadtree section above. Not the
+   win it might look like on paper: this codec's fixed-width bitstream
+   makes every leaf cost the same number of bits regardless of size or
+   content, so a flat error threshold and a proper `error + λ·bits`
+   Lagrangian criterion are structurally close to equivalent here (proven
+   algebraically, not just observed). The real lesson is that RDO's
+   advantage needs variable per-leaf bit cost to have something to exploit
+   — entropy coding already shows real bit-cost variation exists
+   (`c_idx` costs measurably fewer bits than `k_idx`); feeding *that* into
+   the Lagrangian instead of the fixed-width estimate is the version of
+   this idea that might actually move the needle, not attempted here.
 4. **A proper comparison study.** Systematically benchmark this causal/
    non-iterative variant against classical iterative fractal coding (accuracy,
    speed, memory) across a standard test set (Kodak, USC-SIPI) — even without

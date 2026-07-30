@@ -43,6 +43,9 @@ class FractalConfig:
     quantization_aware: bool = False  # pick the domain position by post-quantization
                                        # error instead of continuous error; see the
                                        # design note above _search_domain in encoder.py
+    rdo_lambda: float | None = None   # if set, replaces the error_thresh split rule with
+                                       # a Lagrangian error + lambda*bits criterion; see the
+                                       # design note above the split logic in _encode_block
 
 
 @dataclass

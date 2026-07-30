@@ -59,6 +59,8 @@ class _Candidate:
     partition_bits: list
     transforms: list
     patch: np.ndarray
+    bits: int = 0  # total bit cost of this candidate's subtree; only
+                    # populated/used in RDO mode (config.rdo_lambda set)
 
 
 def _domain_integral_images(recon_known: np.ndarray) -> tuple:
@@ -168,17 +170,77 @@ def _search_domain(range_block: np.ndarray, recon_known: np.ndarray,
     return _SearchResult(best_y, best_x, k_idx, c_idx, patch, final_error)
 
 
-def _encode_block(original, recon_known, ii, ii2, row, col, rows, cols, config: FractalConfig) -> _Candidate:
+def _encode_block(original, recon_known, ii, ii2, row, col, rows, cols, config: FractalConfig,
+                   coord_bits: int) -> _Candidate:
+    """In plain terms: for every block, this asks "does splitting into four
+    smaller blocks reduce error by enough to be worth the extra bits it
+    costs to describe four leaves instead of one?" Two ways to answer that
+    question are supported:
+
+    - Legacy (config.rdo_lambda is None): "enough" means a fixed error
+      quantity, config.error_thresh, regardless of how many bits are
+      actually at stake.
+    - RDO (config.rdo_lambda set): "enough" means the actual bit cost is
+      accounted for via a Lagrangian error + lambda*bits score -- split
+      only if it lowers that combined score. See the design note inline
+      below for the exact math and why this codec's fixed-width bitstream
+      (every leaf costs the same number of bits, regardless of size) makes
+      the two criteria closer to each other than they'd be in a codec
+      where leaf cost varies with content or size.
+    """
     range_block = original[row:row + rows, col:col + cols]
     leaf = _search_domain(range_block, recon_known, ii, ii2, config)
+    per_leaf_bits = 2 * coord_bits + config.k_bits + config.c_bits
+    leaf_bits = 1 + per_leaf_bits  # 1 partition bit ("not split") + this leaf's payload
     leaf_candidate = _Candidate(
         error=leaf.error,
         partition_bits=[0],
         transforms=[Transform(row, col, rows, cols,
                                leaf.domain_row, leaf.domain_col, leaf.k_idx, leaf.c_idx)],
         patch=leaf.patch,
+        bits=leaf_bits,
     )
 
+    if config.rdo_lambda is not None:
+        # RDO mode: split iff it lowers the Lagrangian cost error + lambda*bits,
+        # instead of iff it lowers error by more than a flat error_thresh.
+        #
+        # The same early-termination shortcut used below for error_thresh
+        # generalizes here. Every child leaf costs at least `leaf_bits` bits
+        # (more if it splits further), so no matter what the four children
+        # turn out to be, split_bits >= 1 + 4*leaf_bits -- a fixed lower
+        # bound. Combined with split_error >= 0 (sum of squared errors), the
+        # lowest possible split_cost is lambda*(1 + 4*leaf_bits). So whenever
+        # leaf.error + lambda*leaf_bits <= lambda*(1 + 4*leaf_bits) --
+        # i.e. leaf.error <= lambda*(4 + 3*per_leaf_bits) -- splitting is
+        # provably never chosen, exactly as the error_thresh shortcut is
+        # provably safe for its own criterion.
+        if leaf.error <= config.rdo_lambda * (4 + 3 * per_leaf_bits):
+            return leaf_candidate
+
+        prow, pcol = rows // 2, cols // 2
+        if prow >= config.min_block and pcol >= config.min_block:
+            c1 = _encode_block(original, recon_known, ii, ii2, row, col, prow, pcol, config, coord_bits)
+            c2 = _encode_block(original, recon_known, ii, ii2, row, col + pcol, prow, cols - pcol, config, coord_bits)
+            c3 = _encode_block(original, recon_known, ii, ii2, row + prow, col + pcol, rows - prow, cols - pcol, config, coord_bits)
+            c4 = _encode_block(original, recon_known, ii, ii2, row + prow, col, rows - prow, pcol, config, coord_bits)
+            split_error = c1.error + c2.error + c3.error + c4.error
+            split_bits = 1 + c1.bits + c2.bits + c3.bits + c4.bits
+
+            if split_error + config.rdo_lambda * split_bits < leaf.error + config.rdo_lambda * leaf_bits:
+                patch = np.zeros((rows, cols))
+                patch[:prow, :pcol] = c1.patch
+                patch[:prow, pcol:] = c2.patch
+                patch[prow:, pcol:] = c3.patch
+                patch[prow:, :pcol] = c4.patch
+                bits_list = [1] + c1.partition_bits + c2.partition_bits + c3.partition_bits + c4.partition_bits
+                transforms = c1.transforms + c2.transforms + c3.transforms + c4.transforms
+                return _Candidate(split_error, bits_list, transforms, patch, split_bits)
+
+        return leaf_candidate
+
+    # Legacy fixed-error_thresh mode (config.rdo_lambda is None).
+    #
     # Early-termination pruning: the split test below is
     # `leaf.error > split_error + error_thresh`, where split_error is a sum
     # of squared errors and therefore always >= 0. That means
@@ -198,10 +260,10 @@ def _encode_block(original, recon_known, ii, ii2, row, col, rows, cols, config: 
 
     prow, pcol = rows // 2, cols // 2
     if prow >= config.min_block and pcol >= config.min_block:
-        c1 = _encode_block(original, recon_known, ii, ii2, row, col, prow, pcol, config)
-        c2 = _encode_block(original, recon_known, ii, ii2, row, col + pcol, prow, cols - pcol, config)
-        c3 = _encode_block(original, recon_known, ii, ii2, row + prow, col + pcol, rows - prow, cols - pcol, config)
-        c4 = _encode_block(original, recon_known, ii, ii2, row + prow, col, rows - prow, pcol, config)
+        c1 = _encode_block(original, recon_known, ii, ii2, row, col, prow, pcol, config, coord_bits)
+        c2 = _encode_block(original, recon_known, ii, ii2, row, col + pcol, prow, cols - pcol, config, coord_bits)
+        c3 = _encode_block(original, recon_known, ii, ii2, row + prow, col + pcol, rows - prow, cols - pcol, config, coord_bits)
+        c4 = _encode_block(original, recon_known, ii, ii2, row + prow, col, rows - prow, pcol, config, coord_bits)
         split_error = c1.error + c2.error + c3.error + c4.error
 
         if leaf.error > split_error + config.error_thresh:
@@ -210,9 +272,9 @@ def _encode_block(original, recon_known, ii, ii2, row, col, rows, cols, config: 
             patch[:prow, pcol:] = c2.patch
             patch[prow:, pcol:] = c3.patch
             patch[prow:, :pcol] = c4.patch
-            bits = [1] + c1.partition_bits + c2.partition_bits + c3.partition_bits + c4.partition_bits
+            bits_list = [1] + c1.partition_bits + c2.partition_bits + c3.partition_bits + c4.partition_bits
             transforms = c1.transforms + c2.transforms + c3.transforms + c4.transforms
-            return _Candidate(split_error, bits, transforms, patch)
+            return _Candidate(split_error, bits_list, transforms, patch)
 
     return leaf_candidate
 
@@ -220,6 +282,7 @@ def _encode_block(original, recon_known, ii, ii2, row, col, rows, cols, config: 
 def encode_channel(channel: np.ndarray, config: FractalConfig) -> EncodedChannel:
     padded, orig_h, orig_w = pad_channel(channel, config.init_size, config.max_block)
     H, W = padded.shape
+    coord_bits = max(1, int(np.ceil(np.log2(H))))  # matches EncodedChannel.coord_bits
 
     recon = np.zeros((H, W), dtype=np.float64)
     # Quantize the seed to real byte values up front -- it's serialized as
@@ -245,7 +308,7 @@ def encode_channel(channel: np.ndarray, config: FractalConfig) -> EncodedChannel
             this_rows = min(range_rows, domain_rows - row)
             known = recon[:domain_rows, :domain_cols]
             ii, ii2 = _domain_integral_images(known)
-            cand = _encode_block(padded, known, ii, ii2, row, domain_cols, this_rows, range_cols, config)
+            cand = _encode_block(padded, known, ii, ii2, row, domain_cols, this_rows, range_cols, config, coord_bits)
             recon[row:row + this_rows, domain_cols:domain_cols + range_cols] = cand.patch
             for b in cand.partition_bits:
                 partition_writer.write_bit(b)
@@ -263,7 +326,7 @@ def encode_channel(channel: np.ndarray, config: FractalConfig) -> EncodedChannel
             this_cols = min(range_cols2, domain_cols - col)
             known = recon[:domain_rows, :domain_cols]
             ii, ii2 = _domain_integral_images(known)
-            cand = _encode_block(padded, known, ii, ii2, domain_rows, col, range_rows2, this_cols, config)
+            cand = _encode_block(padded, known, ii, ii2, domain_rows, col, range_rows2, this_cols, config, coord_bits)
             recon[domain_rows:domain_rows + range_rows2, col:col + this_cols] = cand.patch
             for b in cand.partition_bits:
                 partition_writer.write_bit(b)

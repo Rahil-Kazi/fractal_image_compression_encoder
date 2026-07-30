@@ -214,7 +214,54 @@ but modest: only **~0–20% fewer node visits, ~1–8% faster encode** on
 `min_block=2` forces deep recursion regardless of pruning. Doesn't claw back
 #3's overhead. Kept anyway since it's free and strictly safe.
 
-### 6. A separate theory document (not in this repo)
+### 6. RDO quadtree split (`FractalConfig(rdo_lambda=...)`)
+Replaces the fixed `error_thresh` split rule with the standard Lagrangian
+`error + λ·bits` criterion (same idea as HEVC/AV1 CTU splitting): split iff
+it lowers the combined score, using the *real* bit cost of leaf-vs-split
+(not a flat error quantity). Opt-in via `rdo_lambda: float | None = None`
+on `FractalConfig` — `None` (default) is byte-identical to the pre-existing
+`error_thresh` path (tested directly).
+
+**Math worked out and load-bearing (see the design-note comment above the
+branch in `_encode_block`):** since this codec's bitstream is fixed-width,
+`per_leaf_bits` (bit cost of one leaf) is a **constant**, independent of
+block size or content. That gives two things:
+- A candidate's total `bits` is trackable through the recursion exactly
+  like `error` already was (`_Candidate.bits`, computed bottom-up:
+  `1 + per_leaf_bits` for a leaf, `1 + sum(children.bits)` for a split).
+- The existing early-termination proof **generalizes cleanly**: every child
+  contributes ≥ `1 + per_leaf_bits` bits regardless of content, so
+  `split_bits ≥ 1 + 4·(1+per_leaf_bits)` unconditionally, and combined with
+  `split_error ≥ 0`, splitting is provably never chosen whenever
+  `leaf.error ≤ λ·(4 + 3·per_leaf_bits)` — same shape as the original
+  proof, re-derived for the new criterion. Verified exactly lossless the
+  same way as #5 (`inspect.getsource`-derived reference, not a hand copy) —
+  `tests/test_rdo_quadtree.py`.
+
+**Honest finding: RDO and the fixed threshold land on nearly the same
+rate-distortion curve** (`results/rdo_quadtree.{csv,png}`) — not a clear
+win. This isn't a bug or a tuning issue, it's structural: because
+`per_leaf_bits` is constant, the Lagrangian test algebraically reduces (for
+any node whose children don't split further) to
+`leaf.error − split_error > λ·(1 + 3·per_leaf_bits)` — literally the same
+*form* as `error_thresh`, just reparameterized. RDO's real advantage over a
+flat threshold — correctly weighing splits whose bit cost genuinely
+varies — doesn't get to show up in this codec because leaf bit cost never
+varies. **If this is revisited, the version worth trying is feeding
+entropy coding's *actual*, non-uniform realized bit costs (`c_idx` measurably
+costs fewer real bits than `k_idx`, per `entropy.py`'s findings) into
+`λ·bits` instead of the fixed-width estimate** — that's where genuine
+per-leaf bit-cost variation actually exists in this codebase. Not
+implemented.
+
+Calibration note: `error_thresh` and `λ` are different units (error vs.
+bits), not comparable a priori — the benchmark sweep range
+(`[0.2, 0.5, 1, 2, 5, 10, 20, 50]`) was picked by first running a quick
+calibration pass to find λ values spanning a comparable bpp range to the
+existing `error_thresh` sweep, the same "check empirically before
+committing to a design" pattern used for the entropy-coding streams (#1).
+
+### 7. A separate theory document (not in this repo)
 A standalone "Fractal Image Compression — Theory & Flow" explainer was
 published as a Claude Artifact (not a repo file) for an MS EE student
 audience — covers self-similarity, range/domain blocks, the affine
@@ -226,30 +273,28 @@ re-located via the Artifact tool's list action, or re-created if truly lost.
 
 ## Current verified state (as of the last commit on `main`)
 
-- 15/15 tests passing (`test_roundtrip.py`, `test_entropy.py`,
-  `test_quantization_aware_search.py`, `test_early_termination.py`).
-- `results/` has 4 benchmark outputs: `rate_distortion.{csv,png}` (fractal
+- 21/21 tests passing (`test_roundtrip.py`, `test_entropy.py`,
+  `test_quantization_aware_search.py`, `test_early_termination.py`,
+  `test_rdo_quadtree.py`).
+- `results/` has 5 benchmark outputs: `rate_distortion.{csv,png}` (fractal
   vs. fractal+entropy vs. JPEG), `ablation_error_thresh.{csv,png}`,
   `color_chroma.csv`, `quantization_aware.{csv,png}` (continuous- vs.
-  quantized-error search, grayscale + one color case).
-- `FractalConfig` now has two opt-in flags beyond the original design:
-  `quantization_aware` (default `False`) and the always-on early-termination
-  pruning (no flag — it's lossless).
+  quantized-error search, grayscale + one color case), `rdo_quadtree.{csv,png}`
+  (Lagrangian vs. fixed-threshold split).
+- `FractalConfig` now has three opt-in-or-safe additions beyond the original
+  design: `quantization_aware` (default `False`), `rdo_lambda` (default
+  `None`, falls back to `error_thresh`), and the always-on early-termination
+  pruning (no flag needed for the legacy path — it's lossless; RDO mode has
+  its own analogous always-on pruning too).
 
 ## What's still open (from the original task brief, not yet done)
 
-The session that started this work was handed a 5-priority task list. Only
-entropy coding (Priority 1) and a chunk of the search-quality work (which
-turned into quantization-aware search + early termination, not originally
-scoped but a bigger win than Priority 1 alone) are done. Still open:
+The session that started this work was handed a 5-priority task list.
+Entropy coding (Priority 1), the search-quality work (quantization-aware
+search + early termination, not originally scoped but a bigger win than
+Priority 1 alone), and Priority 2 (RDO quadtree, though it landed as a
+mostly-negative/structural finding rather than a win) are done. Still open:
 
-- **RDO-style adaptive `ERROR_THRESH`/block-size selection** (original
-  Priority 2) — a Lagrangian `error + λ·bits` split criterion instead of the
-  fixed `error_thresh`. The ablation study already shows most fine-grained
-  splitting buys little quality; this is the natural next lever, and ties
-  directly into why early-termination's impact was modest (a smarter split
-  criterion might prune much more aggressively than the current threshold
-  does).
 - **A real performance pass** beyond what's been tried — profiling still
   points at `scipy.signal.correlate` as the dominant per-node cost, not
   Python overhead. GPU offload might still be worth it if batched by tree

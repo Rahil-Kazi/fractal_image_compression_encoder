@@ -9,6 +9,8 @@ Produces:
   results/color_chroma.csv           chroma-subsampling on/off comparison
   results/quantization_aware.csv     continuous- vs quantized-error domain search
   results/quantization_aware.png
+  results/rdo_quadtree.csv           Lagrangian (error + lambda*bits) split vs fixed error_thresh
+  results/rdo_quadtree.png
 
 Run with:  python3 benchmarks/run_benchmark.py
 """
@@ -259,9 +261,73 @@ def run_quantization_aware_comparison():
     return rows
 
 
+def run_rdo_comparison():
+    print("== RDO (error + lambda*bits) vs fixed error_thresh quadtree split ==")
+    rows = []
+    error_threshs = [30, 60, 100, 150, 250, 400, 700]
+    # Calibrated empirically (see CLAUDE.md) to span a comparable bpp range
+    # to the error_thresh sweep above -- error and bit units aren't
+    # comparable a priori, so lambda can't just reuse error_thresh's scale.
+    rdo_lambdas = [0.2, 0.5, 1, 2, 5, 10, 20, 50]
+
+    for name, img in get_test_images().items():
+        for et in error_threshs:
+            cfg = FractalConfig(error_thresh=et, max_block=64, step=1)
+            t0 = time.time()
+            enc = encode_channel(img, cfg)
+            enc_time = time.time() - t0
+            recon = decode_channel(enc)
+            rows.append({
+                "image": name, "mode": "error_thresh", "param": et,
+                "bpp": enc.bits_per_pixel(), "psnr": psnr(img, recon),
+                "ssim": ssim_score(img, recon), "n_leaves": len(enc.transforms),
+                "encode_s": enc_time,
+            })
+        for lam in rdo_lambdas:
+            cfg = FractalConfig(rdo_lambda=lam, max_block=64, step=1)
+            t0 = time.time()
+            enc = encode_channel(img, cfg)
+            enc_time = time.time() - t0
+            recon = decode_channel(enc)
+            rows.append({
+                "image": name, "mode": "rdo", "param": lam,
+                "bpp": enc.bits_per_pixel(), "psnr": psnr(img, recon),
+                "ssim": ssim_score(img, recon), "n_leaves": len(enc.transforms),
+                "encode_s": enc_time,
+            })
+            print(f"  {name} rdo_lambda={lam:>5} leaves={len(enc.transforms):>4} "
+                  f"bpp={enc.bits_per_pixel():.3f} PSNR={psnr(img, recon):.2f} enc={enc_time:.2f}s")
+
+    with open(os.path.join(RESULTS_DIR, "rdo_quadtree.csv"), "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+    fig, axes = plt.subplots(1, len(get_test_images()), figsize=(6 * len(get_test_images()), 5))
+    if len(get_test_images()) == 1:
+        axes = [axes]
+    for ax, name in zip(axes, get_test_images().keys()):
+        for mode, marker in [("error_thresh", "o-"), ("rdo", "^-")]:
+            pts = [(r["bpp"], r["psnr"]) for r in rows if r["image"] == name and r["mode"] == mode]
+            pts.sort()
+            xs, ys = zip(*pts)
+            label = "RDO (error + lambda*bits)" if mode == "rdo" else "fixed error_thresh (current)"
+            ax.plot(xs, ys, marker, label=label)
+        ax.set_xlabel("bits per pixel")
+        ax.set_ylabel("PSNR (dB)")
+        ax.set_title(name)
+        ax.legend()
+        ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(RESULTS_DIR, "rdo_quadtree.png"), dpi=130)
+    print("  saved rdo_quadtree.csv / .png\n")
+    return rows
+
+
 if __name__ == "__main__":
     run_rate_distortion()
     run_ablation()
     run_color_experiment()
     run_quantization_aware_comparison()
+    run_rdo_comparison()
     print("Done. See results/ for CSVs and plots.")
