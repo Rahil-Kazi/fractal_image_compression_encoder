@@ -19,7 +19,8 @@ Key differences from the original C++ FractalCompression:
 from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
-from scipy.signal import correlate
+from scipy.signal import correlate, choose_conv_method
+from scipy import fft as sp_fft
 
 from .codec import (
     FractalConfig, Transform, EncodedChannel,
@@ -77,8 +78,64 @@ def _domain_integral_images(recon_known: np.ndarray) -> tuple:
     return ii, ii2
 
 
+class _DomainFFTCache:
+    """Caches the domain side of the FFT cross-correlation, keyed by kernel
+    (range-block) size, for one domain snapshot (one `_domain_integral_images`
+    call site) -- built once per top-level scan chunk and reused across
+    every recursive quadtree node it contains, exactly like `ii`/`ii2` above.
+
+    Verified (see CLAUDE.md "Evaluating prior-art idea #2") on a real
+    camera_128 encode: 231 node visits share only 15 distinct domain
+    snapshots (median 13 nodes/snapshot, max 73), and `correlate`'s FFT path
+    was redundantly recomputing the *domain's* FFT at every single visit
+    despite the domain being unchanged. Reuse must be scoped per kernel
+    size, not one shared pad size for the largest kernel seen against a
+    domain -- an earlier version that padded every kernel to fit the
+    group's largest one was correctness-verified but measured *slower*
+    (0.91x), because it forces small kernels through an unnecessarily large
+    FFT instead of the size-matched one scipy's own heuristic would pick.
+
+    Falls back to plain `scipy.signal.correlate` (no caching) whenever
+    `choose_conv_method` would pick 'direct' for this domain/kernel pair --
+    caching only ever helps the 'fft' path, and forcing tiny arrays through
+    an FFT here would risk regressing exactly the small-kernel case the
+    comment on the plain `correlate()` call below already found scipy's
+    'auto' heuristic handles better than a manual override.
+    """
+
+    def __init__(self, domain: np.ndarray):
+        self.domain = domain
+        self._cache: dict[tuple[int, int], tuple[tuple[int, int], np.ndarray]] = {}
+
+    def correlate_valid(self, kernel: np.ndarray) -> np.ndarray:
+        method = choose_conv_method(self.domain, kernel, mode='valid')
+        if method != 'fft':
+            return correlate(self.domain, kernel, mode='valid', method='direct')
+
+        kh, kw = kernel.shape
+        key = (kh, kw)
+        entry = self._cache.get(key)
+        if entry is None:
+            pad_shape = (
+                sp_fft.next_fast_len(self.domain.shape[0] + kh - 1),
+                sp_fft.next_fast_len(self.domain.shape[1] + kw - 1),
+            )
+            fft_domain = sp_fft.rfft2(self.domain, s=pad_shape)
+            entry = (pad_shape, fft_domain)
+            self._cache[key] = entry
+        pad_shape, fft_domain = entry
+
+        fft_kernel = sp_fft.rfft2(kernel[::-1, ::-1], s=pad_shape)
+        full = sp_fft.irfft2(fft_domain * fft_kernel, s=pad_shape)
+        full = full[:self.domain.shape[0] + kh - 1, :self.domain.shape[1] + kw - 1]
+        valid_h = self.domain.shape[0] - kh + 1
+        valid_w = self.domain.shape[1] - kw + 1
+        return full[kh - 1:kh - 1 + valid_h, kw - 1:kw - 1 + valid_w]
+
+
 def _search_domain(range_block: np.ndarray, recon_known: np.ndarray,
-                    ii: np.ndarray, ii2: np.ndarray, config: FractalConfig) -> _SearchResult:
+                    ii: np.ndarray, ii2: np.ndarray, config: FractalConfig,
+                    domain_cache: "_DomainFFTCache | None" = None) -> _SearchResult:
     rows, cols = range_block.shape
     n = rows * cols
 
@@ -92,7 +149,15 @@ def _search_domain(range_block: np.ndarray, recon_known: np.ndarray,
     # in profiling -- scipy's C direct-correlation loop doesn't vectorize
     # as well as its FFT path even for small kernels against a mid-size
     # domain), so we defer to it rather than second-guess it.
-    cross = correlate(recon_known, range_block, mode='valid', method='auto')
+    #
+    # When a domain_cache is available (the real encode_channel path always
+    # provides one), it reuses the domain-side FFT across every node that
+    # shares this exact domain snapshot and kernel size instead of paying
+    # for it fresh at every node -- see _DomainFFTCache's docstring.
+    if domain_cache is not None:
+        cross = domain_cache.correlate_valid(range_block)
+    else:
+        cross = correlate(recon_known, range_block, mode='valid', method='auto')
 
     step = config.step
     sum_domain = sum_domain[::step, ::step]
@@ -171,7 +236,7 @@ def _search_domain(range_block: np.ndarray, recon_known: np.ndarray,
 
 
 def _encode_block(original, recon_known, ii, ii2, row, col, rows, cols, config: FractalConfig,
-                   coord_bits: int) -> _Candidate:
+                   coord_bits: int, domain_cache: "_DomainFFTCache | None" = None) -> _Candidate:
     """In plain terms: for every block, this asks "does splitting into four
     smaller blocks reduce error by enough to be worth the extra bits it
     costs to describe four leaves instead of one?" Two ways to answer that
@@ -189,7 +254,7 @@ def _encode_block(original, recon_known, ii, ii2, row, col, rows, cols, config: 
       where leaf cost varies with content or size.
     """
     range_block = original[row:row + rows, col:col + cols]
-    leaf = _search_domain(range_block, recon_known, ii, ii2, config)
+    leaf = _search_domain(range_block, recon_known, ii, ii2, config, domain_cache)
     per_leaf_bits = 2 * coord_bits + config.k_bits + config.c_bits
     leaf_bits = 1 + per_leaf_bits  # 1 partition bit ("not split") + this leaf's payload
     leaf_candidate = _Candidate(
@@ -220,10 +285,10 @@ def _encode_block(original, recon_known, ii, ii2, row, col, rows, cols, config: 
 
         prow, pcol = rows // 2, cols // 2
         if prow >= config.min_block and pcol >= config.min_block:
-            c1 = _encode_block(original, recon_known, ii, ii2, row, col, prow, pcol, config, coord_bits)
-            c2 = _encode_block(original, recon_known, ii, ii2, row, col + pcol, prow, cols - pcol, config, coord_bits)
-            c3 = _encode_block(original, recon_known, ii, ii2, row + prow, col + pcol, rows - prow, cols - pcol, config, coord_bits)
-            c4 = _encode_block(original, recon_known, ii, ii2, row + prow, col, rows - prow, pcol, config, coord_bits)
+            c1 = _encode_block(original, recon_known, ii, ii2, row, col, prow, pcol, config, coord_bits, domain_cache)
+            c2 = _encode_block(original, recon_known, ii, ii2, row, col + pcol, prow, cols - pcol, config, coord_bits, domain_cache)
+            c3 = _encode_block(original, recon_known, ii, ii2, row + prow, col + pcol, rows - prow, cols - pcol, config, coord_bits, domain_cache)
+            c4 = _encode_block(original, recon_known, ii, ii2, row + prow, col, rows - prow, pcol, config, coord_bits, domain_cache)
             split_error = c1.error + c2.error + c3.error + c4.error
             split_bits = 1 + c1.bits + c2.bits + c3.bits + c4.bits
 
@@ -260,10 +325,10 @@ def _encode_block(original, recon_known, ii, ii2, row, col, rows, cols, config: 
 
     prow, pcol = rows // 2, cols // 2
     if prow >= config.min_block and pcol >= config.min_block:
-        c1 = _encode_block(original, recon_known, ii, ii2, row, col, prow, pcol, config, coord_bits)
-        c2 = _encode_block(original, recon_known, ii, ii2, row, col + pcol, prow, cols - pcol, config, coord_bits)
-        c3 = _encode_block(original, recon_known, ii, ii2, row + prow, col + pcol, rows - prow, cols - pcol, config, coord_bits)
-        c4 = _encode_block(original, recon_known, ii, ii2, row + prow, col, rows - prow, pcol, config, coord_bits)
+        c1 = _encode_block(original, recon_known, ii, ii2, row, col, prow, pcol, config, coord_bits, domain_cache)
+        c2 = _encode_block(original, recon_known, ii, ii2, row, col + pcol, prow, cols - pcol, config, coord_bits, domain_cache)
+        c3 = _encode_block(original, recon_known, ii, ii2, row + prow, col + pcol, rows - prow, cols - pcol, config, coord_bits, domain_cache)
+        c4 = _encode_block(original, recon_known, ii, ii2, row + prow, col, rows - prow, pcol, config, coord_bits, domain_cache)
         split_error = c1.error + c2.error + c3.error + c4.error
 
         if leaf.error > split_error + config.error_thresh:
@@ -308,7 +373,8 @@ def encode_channel(channel: np.ndarray, config: FractalConfig) -> EncodedChannel
             this_rows = min(range_rows, domain_rows - row)
             known = recon[:domain_rows, :domain_cols]
             ii, ii2 = _domain_integral_images(known)
-            cand = _encode_block(padded, known, ii, ii2, row, domain_cols, this_rows, range_cols, config, coord_bits)
+            domain_cache = _DomainFFTCache(known)
+            cand = _encode_block(padded, known, ii, ii2, row, domain_cols, this_rows, range_cols, config, coord_bits, domain_cache)
             recon[row:row + this_rows, domain_cols:domain_cols + range_cols] = cand.patch
             for b in cand.partition_bits:
                 partition_writer.write_bit(b)
@@ -326,7 +392,8 @@ def encode_channel(channel: np.ndarray, config: FractalConfig) -> EncodedChannel
             this_cols = min(range_cols2, domain_cols - col)
             known = recon[:domain_rows, :domain_cols]
             ii, ii2 = _domain_integral_images(known)
-            cand = _encode_block(padded, known, ii, ii2, domain_rows, col, range_rows2, this_cols, config, coord_bits)
+            domain_cache = _DomainFFTCache(known)
+            cand = _encode_block(padded, known, ii, ii2, domain_rows, col, range_rows2, this_cols, config, coord_bits, domain_cache)
             recon[domain_rows:domain_rows + range_rows2, col:col + this_cols] = cand.patch
             for b in cand.partition_bits:
                 partition_writer.write_bit(b)
