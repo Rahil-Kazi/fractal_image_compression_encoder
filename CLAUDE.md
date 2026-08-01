@@ -642,37 +642,95 @@ search + early termination, not originally scoped but a bigger win than
 Priority 1 alone), and Priority 2 (RDO quadtree, though it landed as a
 mostly-negative/structural finding rather than a win) are done. Still open:
 
-- **A real performance pass** beyond what's been tried — profiling still
-  points at `scipy.signal.correlate` as the dominant per-node cost (97.7%
-  of encode time on `camera_128`), not Python overhead. **Update: prototyped
-  and verified a concrete, non-GPU angle on this** (see "Prior art
-  literature review" below, item #2 evaluation) — within one top-level
-  block's recursion, `recon_known` (the domain buffer) is shared across
-  many nodes (real profile: 231 node visits, only 15 distinct domain
-  buffers, largest shared by 73 nodes), and `scipy.signal.correlate`'s FFT
-  path redundantly recomputes the domain-side FFT at every one of those
-  visits even though the domain hasn't changed. Reusing one FFT per
-  distinct domain buffer, batched **within same-kernel-size sibling
-  groups** (a naive single-fixed-pad-size version that ignores kernel size
-  was tested first and made things *slower* — see write-up below for why),
-  measured a correctness-verified **1.67x speedup** on the real per-node
-  kernel-size distribution from an actual encode. Gated on one specific,
-  scoped engineering task: restructuring `_encode_block`'s recursion from
-  depth-first to level-order/BFS (process all nodes at one depth, batch
-  same-size sibling searches against a shared domain FFT, decide splits,
-  descend) — early-termination's correctness proof is unaffected, since
-  it's still decided node-by-node, just reordered in *when* it happens.
-  Not yet implemented in the real encoder; the FFT-reuse math is prototyped
-  and verified in isolation, not wired into `_search_domain`/`_encode_block`.
-  GPU offload remains a separate, likely lower-priority question now that a
+- ~~A real performance pass~~ **Done for the CPU-side domain-FFT-reuse angle
+  — implemented, verified, and committed (`3e67a7a`).** Profiling had
+  pointed at `scipy.signal.correlate` as the dominant per-node cost (97.7%
+  of encode time on `camera_128`), and within one top-level block's
+  recursion `recon_known` (the domain buffer) turned out to be shared
+  across many nodes (real profile: 231 node visits, only 15 distinct domain
+  buffers, largest shared by 73 nodes) — `correlate`'s FFT path was
+  redundantly recomputing the domain-side FFT at every visit despite the
+  domain being unchanged. `_DomainFFTCache` (`encoder.py`) memoizes it per
+  (domain, kernel-size) pair instead. **Turned out not to need the BFS/
+  level-order recursion restructuring originally thought necessary** — a
+  cache keyed by kernel size works fine with the existing depth-first
+  recursion unchanged, since reuse only depends on having seen that
+  (domain, size) pair before, not on visit order. Measured end-to-end:
+  8–23% faster encode (camera_128 ~19%, coins_128 ~17%, camera_256 ~8% —
+  the smaller gain at larger size is a real, not-yet-explained pattern
+  worth another look if this gets revisited), 21/21 tests still pass.
+  **Important caveat, not swept under the rug:** unlike early-termination
+  and RDO pruning, this is *not* provably bit-exact — in a small fraction
+  of blocks (0–0.44% across three test images), a near-exact tie between
+  two candidate domain positions gets broken differently due to
+  floating-point rounding differences between the cached-FFT path and
+  scipy's own internal one. Effect measured as negligible in every case
+  found (identical bit cost always; PSNR differences from identical-to-14-
+  decimals up to 0.0002 dB worst case) but it is a real, if narrow, change
+  in this codec's correctness guarantee for the default code path. GPU
+  offload remains a separate, likely lower-priority question now that a
   verified CPU-only win exists on the dominant cost.
 - **A classical iterative fractal-coding baseline** (original Priority 4) —
   for a real causal-vs-classical comparison (speed, quality, memory), not
   just implied by the design notes.
 - **Paper/write-up scaffolding** (original Priority 5) — a `paper/`
-  directory with related-work citations, not started.
-- Larger/more test images (256×256, 512×512, or a real test set like Kodak)
-  — everything so far is 96–128px crops for speed of iteration.
+  directory with related-work citations, not started. A draft abstract
+  exists (produced in conversation, not yet saved to a file) — explicitly
+  deferred, not saved as of this note.
+- ~~Larger/more test images~~ **Done — the real 24-image Kodak test set
+  (native 512×768/768×512, standard PCD source
+  `https://r0k.us/graphics/kodak/`) is downloaded into `data/kodak/`
+  (gitignored — kept local-only, matching the same local-only decision made
+  for `prior_art_literature/`), and `benchmarks/run_kodak_benchmark.py`
+  (new, standalone script, deliberately not wired into `run_benchmark.py`'s
+  `__main__` — see runtime discussion below) ran a single fixed config
+  (`quantization_aware=True, error_thresh=100`) across all 24 images.
+  Results in `results/kodak_benchmark.csv`/`.png`. **Headline numbers:
+  mean PSNR 46.27dB, mean entropy-coded bpp 4.42**, across real native-
+  resolution photos rather than 96–256px crops.
+
+  **Important finding #1 — scaling:** encode time scales much worse than
+  linearly with image size. One Kodak image (padded to a 1024×1024 canvas
+  internally) took 366.7s/400.2s (quantization_aware=False/True
+  respectively) for a *single* `error_thresh` setting, vs. ~4s for
+  `camera_256`'s 256×256 canvas (16x fewer pixels, nowhere near 16x
+  faster). This is why the existing full parameter sweep (7 `error_thresh`
+  values × 2 `quantization_aware` settings) wasn't run across all 24 images
+  at native resolution — estimated ~35 hours, not attempted; the single-
+  config run above took ~2.7–5.4 hours instead (see finding #2 for why that
+  range is wide).
+
+  **Important finding #2 — a real, but non-reproducible, timing anomaly,
+  investigated and resolved:** in the first full run, 22/24 images encoded
+  in the normal 130–510s range, but kodim19 took 11,263.7s (~3.1 hours) and
+  kodim20 took 1,930.9s (~32min) — 68% of the entire run's wall time, with
+  no content-based explanation (kodim19's transform count, 59,430, was
+  unremarkable — kodim13 has *more* transforms, 91,350, yet only took
+  511s). Re-ran kodim19 alone afterward to check: it reproduced in 415.64s
+  — completely normal, with the exact same transform count (59,430) and
+  PSNR (46.93dB) as the original anomalous run, confirming the *encode
+  result itself* is deterministic and correct; the extra ~10,850s in the
+  original run was a one-off environmental slowdown during the unattended
+  multi-hour background job (competing process, thermal throttling, OS
+  scheduling, sleep/wake — not narrowed down further, and not a codec bug).
+  kodim20 was not independently re-verified but is presumed the same
+  category of transient hiccup, given the same run conditions — an
+  assumption, not confirmed. **If this benchmark is ever re-run and an
+  image takes wildly longer than similar-transform-count peers again,
+  suspect the environment before the algorithm** — this exact pattern has
+  now been checked once and cleared.
+
+  **Process lesson worth keeping:** the original run was launched without
+  `python3 -u`, so `print()` output only flushed at the very end rather
+  than incrementally — checking progress mid-run had to be estimated from
+  CPU time and the known per-image rate rather than read directly from the
+  log (this is also part of why the anomaly wasn't caught live). Use `-u`
+  (or `PYTHONUNBUFFERED=1`) for any future long-running background script
+  if live progress-checking matters.
+- 2 of the 8 IEEE prior-art papers (paper1, paper4 — both on FIC-based
+  image encryption) were explicitly deprioritized and will not be
+  reviewed — not relevant to this project's compression-quality/
+  performance focus, per direct decision, not an oversight.
 
 ## Working norms established this session (keep following these)
 

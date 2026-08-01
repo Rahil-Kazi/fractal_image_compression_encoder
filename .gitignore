@@ -5,3 +5,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+
+# Local-only reference material -- not committed, per explicit decision
+fractal_compression/prior_art_literature/
+data/kodak/
